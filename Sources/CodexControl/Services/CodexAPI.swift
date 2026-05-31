@@ -113,6 +113,22 @@ private struct CreditDetails: Decodable {
         case unlimited
         case balance
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.hasCredits = try container.decode(Bool.self, forKey: .hasCredits)
+        self.unlimited = try container.decode(Bool.self, forKey: .unlimited)
+
+        if let value = try? container.decodeIfPresent(Double.self, forKey: .balance) {
+            self.balance = value
+        } else if let value = try? container.decodeIfPresent(String.self, forKey: .balance),
+                  let parsed = Double(value)
+        {
+            self.balance = parsed
+        } else {
+            self.balance = nil
+        }
+    }
 }
 
 enum CodexAPI {
@@ -129,6 +145,10 @@ enum CodexAPI {
 
     static func loadIdentity(codexHomePath: String) throws -> AuthBackedIdentity {
         let credentials = try self.loadCredentials(codexHomePath: codexHomePath)
+        return self.identity(from: credentials)
+    }
+
+    private static func identity(from credentials: AuthCredentials) -> AuthBackedIdentity {
         let payload = credentials.idToken.flatMap(self.parseJWT)
         let auth = payload?["https://api.openai.com/auth"] as? [String: Any]
         let profile = payload?["https://api.openai.com/profile"] as? [String: Any]
@@ -149,8 +169,15 @@ enum CodexAPI {
         var credentials = try self.loadCredentials(codexHomePath: account.codexHomePath)
 
         if credentials.needsRefresh, !credentials.refreshToken.isEmpty {
-            credentials = try await self.refresh(credentials)
-            try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+            do {
+                credentials = try await self.refresh(credentials)
+                try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+            } catch {
+                if let recovered = await self.recoverSnapshot(for: account, excluding: [credentials.refreshToken]) {
+                    return recovered
+                }
+                throw error
+            }
         }
 
         do {
@@ -162,8 +189,15 @@ enum CodexAPI {
             guard !credentials.refreshToken.isEmpty else {
                 throw CodexAPIError.unauthorized
             }
-            credentials = try await self.refresh(credentials)
-            try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+            do {
+                credentials = try await self.refresh(credentials)
+                try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+            } catch {
+                if let recovered = await self.recoverSnapshot(for: account, excluding: [credentials.refreshToken]) {
+                    return recovered
+                }
+                throw error
+            }
             return try await self.fetchVerifiedSnapshot(
                 codexHomePath: account.codexHomePath,
                 credentials: credentials,
@@ -206,7 +240,7 @@ enum CodexAPI {
         credentials: AuthCredentials,
         fallbackEmail: String?) async throws -> AccountUsageSnapshot
     {
-        let identity = try? self.loadIdentity(codexHomePath: codexHomePath)
+        let identity = self.identity(from: credentials)
         let response = try await self.fetchUsage(
             accessToken: credentials.accessToken,
             accountId: credentials.accountId,
@@ -214,9 +248,9 @@ enum CodexAPI {
         let windows = self.makeNormalizedWindows(response.rateLimit)
 
         return AccountUsageSnapshot(
-            email: identity?.email ?? fallbackEmail,
-            providerAccountID: identity?.providerAccountID ?? credentials.accountId,
-            plan: self.normalizeString(response.planType) ?? identity?.plan,
+            email: identity.email ?? fallbackEmail,
+            providerAccountID: identity.providerAccountID ?? credentials.accountId,
+            plan: self.normalizeString(response.planType) ?? identity.plan,
             allowed: response.rateLimit?.allowed,
             limitReached: response.rateLimit?.limitReached,
             primaryWindow: windows.primary,
@@ -260,6 +294,7 @@ enum CodexAPI {
         let refreshToken = self.stringValue(in: tokens, key: "refresh_token") ?? ""
         let idToken = self.stringValue(in: tokens, key: "id_token")
         let accountId = self.stringValue(in: tokens, key: "account_id")
+            ?? self.accountID(fromIDToken: idToken)
 
         return AuthCredentials(
             accessToken: accessToken,
@@ -343,7 +378,7 @@ enum CodexAPI {
                 accessToken: (json["access_token"] as? String) ?? credentials.accessToken,
                 refreshToken: (json["refresh_token"] as? String) ?? credentials.refreshToken,
                 idToken: (json["id_token"] as? String) ?? credentials.idToken,
-                accountId: credentials.accountId,
+                accountId: credentials.accountId ?? self.accountID(fromIDToken: json["id_token"] as? String),
                 lastRefresh: Date())
         } catch let error as CodexAPIError {
             throw error
@@ -600,6 +635,141 @@ enum CodexAPI {
 
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: value)
+    }
+
+    private struct CredentialRecoveryCandidate {
+        let homePath: String
+        let credentials: AuthCredentials
+        let identity: AuthBackedIdentity
+        let freshness: Date
+    }
+
+    private static func recoverSnapshot(for account: StoredAccount, excluding excludedRefreshTokens: Set<String>) async -> AccountUsageSnapshot? {
+        for candidate in self.recoveryCandidates(for: account, excluding: excludedRefreshTokens) {
+            var credentials = candidate.credentials
+
+            do {
+                if credentials.needsRefresh, !credentials.refreshToken.isEmpty {
+                    credentials = try await self.refresh(credentials)
+                    try self.saveCredentials(credentials, codexHomePath: candidate.homePath)
+                }
+
+                let snapshot = try await self.fetchVerifiedSnapshot(
+                    codexHomePath: candidate.homePath,
+                    credentials: credentials,
+                    fallbackEmail: account.emailHint)
+                try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+                return snapshot
+            } catch CodexAPIError.unauthorized where !credentials.refreshToken.isEmpty {
+                do {
+                    credentials = try await self.refresh(credentials)
+                    try self.saveCredentials(credentials, codexHomePath: candidate.homePath)
+                    let snapshot = try await self.fetchVerifiedSnapshot(
+                        codexHomePath: candidate.homePath,
+                        credentials: credentials,
+                        fallbackEmail: account.emailHint)
+                    try self.saveCredentials(credentials, codexHomePath: account.codexHomePath)
+                    return snapshot
+                } catch {
+                    continue
+                }
+            } catch {
+                continue
+            }
+        }
+
+        return nil
+    }
+
+    private static func recoveryCandidates(for account: StoredAccount, excluding excludedRefreshTokens: Set<String>) -> [CredentialRecoveryCandidate] {
+        let candidateHomes = self.recoveryHomeURLs(for: account)
+        let accountHomePath = URL(fileURLWithPath: account.codexHomePath, isDirectory: true).standardizedFileURL.path
+
+        return candidateHomes.compactMap { homeURL in
+            let homePath = homeURL.standardizedFileURL.path
+            guard homePath != accountHomePath,
+                  let credentials = try? self.loadCredentials(codexHomePath: homePath),
+                  !excludedRefreshTokens.contains(credentials.refreshToken)
+            else {
+                return nil
+            }
+
+            let identity = self.identity(from: credentials)
+            guard self.identity(identity, at: homePath, matches: account) else {
+                return nil
+            }
+
+            return CredentialRecoveryCandidate(
+                homePath: homePath,
+                credentials: credentials,
+                identity: identity,
+                freshness: self.credentialsFreshness(credentials, homePath: homePath))
+        }
+        .sorted { $0.freshness > $1.freshness }
+    }
+
+    private static func recoveryHomeURLs(for account: StoredAccount) -> [URL] {
+        var homes: [URL] = []
+        if let managedHomes = try? FileManager.default.contentsOfDirectory(
+            at: FileLocations.managedHomesDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles])
+        {
+            homes.append(contentsOf: managedHomes)
+        }
+
+        homes.append(FileLocations.ambientCodexHome)
+        return homes
+    }
+
+    private static func identity(_ identity: AuthBackedIdentity, at homePath: String, matches account: StoredAccount) -> Bool {
+        let accountHomePath = URL(fileURLWithPath: account.codexHomePath, isDirectory: true).standardizedFileURL.path
+        if homePath == accountHomePath {
+            return true
+        }
+
+        let accountProviderAccountID = StoredAccount.normalizeIdentifier(account.providerAccountID)
+        let identityProviderAccountID = StoredAccount.normalizeIdentifier(identity.providerAccountID)
+        if let accountProviderAccountID, let identityProviderAccountID {
+            return accountProviderAccountID == identityProviderAccountID
+        }
+
+        if accountProviderAccountID != nil || identityProviderAccountID != nil {
+            return false
+        }
+
+        let accountSubject = StoredAccount.normalizeIdentifier(account.authSubject)
+        let identitySubject = StoredAccount.normalizeIdentifier(identity.authSubject)
+        if let accountSubject, let identitySubject, accountSubject == identitySubject {
+            return true
+        }
+
+        let accountEmail = StoredAccount.normalizeEmail(account.emailHint)
+        let identityEmail = StoredAccount.normalizeEmail(identity.email)
+        if let accountEmail, let identityEmail, accountEmail == identityEmail {
+            return true
+        }
+
+        return false
+    }
+
+    private static func credentialsFreshness(_ credentials: AuthCredentials, homePath: String) -> Date {
+        if let lastRefresh = credentials.lastRefresh {
+            return lastRefresh
+        }
+
+        let authURL = URL(fileURLWithPath: homePath, isDirectory: true).appendingPathComponent("auth.json", isDirectory: false)
+        let values = try? authURL.resourceValues(forKeys: [.contentModificationDateKey])
+        return values?.contentModificationDate ?? .distantPast
+    }
+
+    private static func accountID(fromIDToken idToken: String?) -> String? {
+        guard let payload = idToken.flatMap(self.parseJWT) else {
+            return nil
+        }
+
+        let auth = payload["https://api.openai.com/auth"] as? [String: Any]
+        return self.normalizeString((auth?["chatgpt_account_id"] as? String) ?? (payload["chatgpt_account_id"] as? String))
     }
 
     private static func stringValue(in dictionary: [String: Any], key: String) -> String? {

@@ -71,17 +71,28 @@ struct StoredAccount: Codable, Identifiable, Hashable, Sendable {
         Self.normalizeIdentifier(self.authSubject)
     }
 
+    var normalizedProviderAccountID: String? {
+        Self.normalizeIdentifier(self.providerAccountID)
+    }
+
     var standardizedHomePath: String {
         URL(fileURLWithPath: self.codexHomePath, isDirectory: true).standardizedFileURL.path
     }
 
     func matches(_ other: StoredAccount) -> Bool {
-        if let normalizedAuthSubject, normalizedAuthSubject == other.normalizedAuthSubject
-        {
+        if self.standardizedHomePath == other.standardizedHomePath {
             return true
         }
 
-        if self.standardizedHomePath == other.standardizedHomePath {
+        if let normalizedProviderAccountID, let otherProviderAccountID = other.normalizedProviderAccountID {
+            return normalizedProviderAccountID == otherProviderAccountID
+        }
+
+        if self.normalizedProviderAccountID != nil || other.normalizedProviderAccountID != nil {
+            return false
+        }
+
+        if let normalizedAuthSubject, normalizedAuthSubject == other.normalizedAuthSubject {
             return true
         }
 
@@ -163,6 +174,86 @@ struct StoredAccount: Codable, Identifiable, Hashable, Sendable {
 struct StoredAccountList: Codable, Sendable {
     let version: Int
     let accounts: [StoredAccount]
+    let removedAccounts: [RemovedAccountIdentity]
+
+    init(version: Int, accounts: [StoredAccount], removedAccounts: [RemovedAccountIdentity] = []) {
+        self.version = version
+        self.accounts = accounts
+        self.removedAccounts = removedAccounts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case accounts
+        case removedAccounts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.version = try container.decode(Int.self, forKey: .version)
+        self.accounts = try container.decode([StoredAccount].self, forKey: .accounts)
+        self.removedAccounts = try container.decodeIfPresent([RemovedAccountIdentity].self, forKey: .removedAccounts) ?? []
+    }
+}
+
+struct RemovedAccountIdentity: Codable, Hashable, Sendable {
+    let id: UUID
+    let emailHint: String?
+    let authSubject: String?
+    let providerAccountID: String?
+    let codexHomePath: String
+    let source: StoredAccountSource
+    let removedAt: Date
+
+    init(account: StoredAccount, removedAt: Date = Date()) {
+        self.id = UUID()
+        self.emailHint = account.emailHint
+        self.authSubject = account.authSubject
+        self.providerAccountID = account.providerAccountID
+        self.codexHomePath = account.codexHomePath
+        self.source = account.source
+        self.removedAt = removedAt
+    }
+
+    var normalizedProviderAccountID: String? {
+        StoredAccount.normalizeIdentifier(self.providerAccountID)
+    }
+
+    var normalizedAuthSubject: String? {
+        StoredAccount.normalizeIdentifier(self.authSubject)
+    }
+
+    var normalizedEmailHint: String? {
+        StoredAccount.normalizeEmail(self.emailHint)
+    }
+
+    var standardizedHomePath: String {
+        URL(fileURLWithPath: self.codexHomePath, isDirectory: true).standardizedFileURL.path
+    }
+
+    func matches(_ account: StoredAccount) -> Bool {
+        if self.standardizedHomePath == account.standardizedHomePath {
+            return true
+        }
+
+        if let normalizedProviderAccountID, let accountProviderAccountID = account.normalizedProviderAccountID {
+            return normalizedProviderAccountID == accountProviderAccountID
+        }
+
+        if self.normalizedProviderAccountID != nil || account.normalizedProviderAccountID != nil {
+            return false
+        }
+
+        if let normalizedAuthSubject, normalizedAuthSubject == account.normalizedAuthSubject {
+            return true
+        }
+
+        if let normalizedEmailHint, normalizedEmailHint == account.normalizedEmailHint {
+            return true
+        }
+
+        return false
+    }
 }
 
 struct AccountRuntimeState: Sendable {
