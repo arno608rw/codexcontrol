@@ -36,6 +36,53 @@ def _write_auth(home_path: Path, email: str, account_id: str) -> None:
 
 
 class CodexAccountManagerTests(unittest.TestCase):
+    def test_remove_managed_account_removes_duplicate_homes_for_same_provider(self) -> None:
+        account_id = "83c5ae92-f5ee-41f8-9528-199110d1d0f9"
+        now = datetime(2026, 4, 23, tzinfo=timezone.utc)
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_homes_dir = root / "managed-homes"
+            backups_dir = root / "auth-backups"
+            first_home = managed_homes_dir / "first"
+            duplicate_home = managed_homes_dir / "duplicate"
+            other_home = managed_homes_dir / "other"
+            for home in (first_home, duplicate_home, other_home):
+                home.mkdir(parents=True)
+
+            _write_auth(first_home, "user@example.com", account_id)
+            _write_auth(duplicate_home, "user@example.com", account_id)
+            _write_auth(other_home, "user@example.com", "different-provider")
+
+            manager = CodexAccountManager()
+            account = StoredAccount(
+                id=uuid4(),
+                nickname=None,
+                email_hint="user@example.com",
+                auth_subject=f"auth0|{account_id}",
+                provider_account_id=account_id,
+                codex_home_path=str(first_home),
+                source=StoredAccountSource.MANAGED_BY_APP,
+                created_at=now,
+                updated_at=now,
+                last_authenticated_at=now,
+            )
+
+            def ensure_dirs() -> None:
+                managed_homes_dir.mkdir(parents=True, exist_ok=True)
+                backups_dir.mkdir(parents=True, exist_ok=True)
+
+            with (
+                patch("codexcontrol_windows.account_manager.MANAGED_HOMES_DIRECTORY", managed_homes_dir),
+                patch("codexcontrol_windows.account_manager.AUTH_BACKUPS_DIRECTORY", backups_dir),
+                patch("codexcontrol_windows.account_manager.ensure_directories", side_effect=ensure_dirs),
+            ):
+                manager.remove_managed_files_if_owned(account)
+
+            self.assertFalse(first_home.exists())
+            self.assertFalse(duplicate_home.exists())
+            self.assertTrue(other_home.exists())
+
     def test_switch_active_account_updates_global_state_creator_id(self) -> None:
         old_account_id = "1ea93d04-5c50-42e3-857b-3db850785967"
         new_account_id = "83c5ae92-f5ee-41f8-9528-199110d1d0f9"

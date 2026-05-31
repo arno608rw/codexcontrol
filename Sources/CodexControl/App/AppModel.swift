@@ -25,6 +25,7 @@ final class AppModel: ObservableObject {
     private let snapshotStore = SnapshotStore()
     private let accountManager = CodexAccountManager()
     private let desktopController = CodexDesktopControl()
+    private var removedAccounts: [RemovedAccountIdentity] = []
     private let autoRefreshInterval: TimeInterval = 5 * 60
     private var autoRefreshTask: Task<Void, Never>?
     private var addAccountTask: Task<Void, Never>?
@@ -185,8 +186,12 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let snapshot = self.accounts.filter { !self.requiresReauthentication(accountID: $0.id) }
+        guard !snapshot.isEmpty else {
+            return
+        }
+
         self.isRefreshingAll = true
-        let snapshot = self.accounts
         for account in snapshot {
             var state = self.runtimeStates[account.id] ?? AccountRuntimeState()
             state.isLoading = true
@@ -260,8 +265,9 @@ final class AppModel: ObservableObject {
 
         do {
             let account = try await self.accountManager.addManagedAccount()
+            self.restoreRemovedAccount(account)
             self.accounts = self.accountStore.merge(existing: self.accounts, incoming: [account])
-            try self.accountStore.saveAccounts(self.accounts)
+            try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
             self.selectedAccountID = self.accounts.first(where: { $0.matches(account) })?.id ?? account.id
             self.statusMessage = "\(account.displayName) added."
             if let selectedAccount = self.selectedAccount {
@@ -287,8 +293,9 @@ final class AppModel: ObservableObject {
 
         do {
             let updated = try await self.accountManager.reauthenticate(account)
+            self.restoreRemovedAccount(updated)
             self.mergeAccount(updated)
-            try self.accountStore.saveAccounts(self.accounts)
+            try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
             self.statusMessage = "\(updated.displayName) reauthenticated."
             if let refreshed = self.accounts.first(where: { $0.id == account.id }) {
                 await self.refresh(account: refreshed)
@@ -308,7 +315,7 @@ final class AppModel: ObservableObject {
             let result = try self.accountManager.switchActiveAccount(account, existing: self.accounts)
             if let materializedAccount = result.materializedAccount {
                 self.mergeAccount(materializedAccount)
-                try self.accountStore.saveAccounts(self.accounts)
+                try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
             }
 
             self.loadInitialAccounts()
@@ -395,17 +402,20 @@ final class AppModel: ObservableObject {
 
     private func loadInitialAccounts() {
         do {
-            let loadedAccounts = try self.accountStore.loadAccounts()
+            let stored = try self.accountStore.loadAccountList()
+            self.removedAccounts = stored.removedAccounts
+            let loadedAccounts = stored.accounts.filter { !self.isRemoved($0) }
             let storedAccounts = loadedAccounts.filter { $0.source != .ambient }
             let discoveredManagedAccounts = try self.accountManager.discoverManagedAccounts(existing: loadedAccounts)
             var incomingAccounts = discoveredManagedAccounts
             if let ambientAccount = try self.accountManager.discoverAmbientAccount(existing: loadedAccounts) {
                 incomingAccounts.insert(ambientAccount, at: 0)
             }
+            incomingAccounts.removeAll { self.isRemoved($0) }
 
             self.accounts = self.accountStore.merge(existing: storedAccounts, incoming: incomingAccounts)
-            if self.accounts != loadedAccounts {
-                try self.accountStore.saveAccounts(self.accounts)
+            if self.accounts != stored.accounts {
+                try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
             }
             self.ensureSelection()
             self.refreshActiveIdentity()
@@ -420,12 +430,16 @@ final class AppModel: ObservableObject {
     }
 
     private func remove(_ account: StoredAccount) {
-        self.accounts.removeAll { $0.id == account.id }
+        let removedIdentity = RemovedAccountIdentity(account: account)
+        self.removedAccounts.removeAll { $0.matches(account) }
+        self.removedAccounts.append(removedIdentity)
+
+        self.accounts.removeAll { $0.id == account.id || removedIdentity.matches($0) }
         self.runtimeStates.removeValue(forKey: account.id)
 
         do {
             try self.accountManager.removeManagedFilesIfOwned(account)
-            try self.accountStore.saveAccounts(self.accounts)
+            try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
             self.ensureSelection()
             self.statusMessage = "\(account.displayName) removed."
         } catch {
@@ -478,10 +492,27 @@ final class AppModel: ObservableObject {
 
     private func persistAccountsSilently() {
         do {
-            try self.accountStore.saveAccounts(self.accounts)
+            try self.accountStore.saveAccounts(self.accounts, removedAccounts: self.removedAccounts)
         } catch {
             self.statusMessage = error.localizedDescription
         }
+    }
+
+    private func isRemoved(_ account: StoredAccount) -> Bool {
+        self.removedAccounts.contains { $0.matches(account) }
+    }
+
+    private func restoreRemovedAccount(_ account: StoredAccount) {
+        self.removedAccounts.removeAll { $0.matches(account) }
+    }
+
+    private func requiresReauthentication(accountID: UUID) -> Bool {
+        guard let message = self.runtimeStates[accountID]?.errorMessage?.lowercased() else {
+            return false
+        }
+
+        return message.contains("refresh token")
+            && message.contains("sign in again")
     }
 
     private func persistSnapshotsSilently() {

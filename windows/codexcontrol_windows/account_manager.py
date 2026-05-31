@@ -162,15 +162,16 @@ class CodexAccountManager:
             return
 
         root = MANAGED_HOMES_DIRECTORY.resolve(strict=False)
-        target = Path(account.codex_home_path).resolve(strict=False)
+        targets = self._managed_home_paths_matching(account)
 
-        try:
-            target.relative_to(root)
-        except ValueError as error:
-            raise CodexAccountManagerError("This path is not an app-managed home directory.") from error
+        for target in targets:
+            try:
+                target.relative_to(root)
+            except ValueError as error:
+                raise CodexAccountManagerError("This path is not an app-managed home directory.") from error
 
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=False)
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=False)
 
     def discover_managed_accounts(self, existing: list[StoredAccount]) -> list[StoredAccount]:
         ensure_directories()
@@ -372,6 +373,25 @@ class CodexAccountManager:
         environment["creator_id"] = updated_creator_id
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
+    def _managed_home_paths_matching(self, account: StoredAccount) -> set[Path]:
+        ensure_directories()
+        targets = {Path(account.codex_home_path).resolve(strict=False)}
+        seen_keys = {_managed_home_key(next(iter(targets)))}
+
+        for home_path in MANAGED_HOMES_DIRECTORY.iterdir():
+            candidate = self._discovered_managed_account(home_path, [account])
+            if candidate is None or not candidate.matches(account):
+                continue
+
+            resolved = home_path.resolve(strict=False)
+            key = _managed_home_key(resolved)
+            if key in seen_keys:
+                continue
+            targets.add(resolved)
+            seen_keys.add(key)
+
+        return targets
+
     def _authenticate_account(
         self,
         home_path: Path,
@@ -494,8 +514,16 @@ def _read_remaining_output(process: subprocess.Popen[str]) -> tuple[str, str]:
 
 
 def _directory_timestamp(path: Path):
+    auth_path = path / "auth.json"
+    if auth_path.exists():
+        return datetime.fromtimestamp(auth_path.stat().st_mtime, tz=timezone.utc)
+
     stat = path.stat()
     return datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+
+
+def _managed_home_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
 
 
 def _updated_creator_id(

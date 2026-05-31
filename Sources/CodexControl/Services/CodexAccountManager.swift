@@ -222,14 +222,17 @@ struct CodexAccountManager {
         }
 
         let root = FileLocations.managedHomesDirectory.standardizedFileURL.path
-        let target = URL(fileURLWithPath: account.codexHomePath, isDirectory: true).standardizedFileURL.path
+        let targets = try self.managedHomePathsMatching(account)
         let prefix = root.hasSuffix("/") ? root : root + "/"
-        guard target.hasPrefix(prefix) else {
-            throw CodexAccountManagerError.unsafeDeletePath
-        }
 
-        if FileManager.default.fileExists(atPath: target) {
-            try FileManager.default.removeItem(atPath: target)
+        for target in targets {
+            guard target.hasPrefix(prefix) else {
+                throw CodexAccountManagerError.unsafeDeletePath
+            }
+
+            if FileManager.default.fileExists(atPath: target) {
+                try FileManager.default.removeItem(atPath: target)
+            }
         }
     }
 
@@ -461,10 +464,41 @@ struct CodexAccountManager {
     }
 
     private func directoryTimestamp(for homeURL: URL) -> Date {
+        let authURL = homeURL.appendingPathComponent("auth.json", isDirectory: false)
+        if let authValues = try? authURL.resourceValues(forKeys: [.contentModificationDateKey]),
+           let contentModificationDate = authValues.contentModificationDate
+        {
+            return contentModificationDate
+        }
+
         let values = try? homeURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
         return values?.contentModificationDate
             ?? values?.creationDate
             ?? Date()
+    }
+
+    private func managedHomePathsMatching(_ account: StoredAccount) throws -> Set<String> {
+        try FileLocations.ensureDirectories()
+
+        var targets: Set<String> = [
+            URL(fileURLWithPath: account.codexHomePath, isDirectory: true).standardizedFileURL.path,
+        ]
+
+        let homeURLs = try FileManager.default.contentsOfDirectory(
+            at: FileLocations.managedHomesDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])
+
+        for homeURL in homeURLs {
+            guard let discovered = self.discoveredManagedAccount(at: homeURL, existing: [account]),
+                  discovered.matches(account)
+            else {
+                continue
+            }
+            targets.insert(homeURL.standardizedFileURL.path)
+        }
+
+        return targets
     }
 
     private func timestampSlug() -> String {

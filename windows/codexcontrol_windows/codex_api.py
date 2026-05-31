@@ -10,6 +10,7 @@ from typing import Any
 
 import requests
 
+from .file_locations import AMBIENT_CODEX_HOME, MANAGED_HOMES_DIRECTORY
 from .models import AccountUsageSnapshot, CreditsBalanceSnapshot, StoredAccount, UsageWindowSnapshot, parse_datetime
 
 
@@ -19,6 +20,7 @@ REFRESH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 REQUEST_TIMEOUT_SECONDS = 30
 _SESSION_STATE = threading.local()
 _USAGE_URL_CACHE: dict[str, tuple[float | None, str]] = {}
+UNAUTHORIZED_MESSAGE = "The Codex usage API request returned unauthorized."
 
 
 class CodexApiError(RuntimeError):
@@ -46,6 +48,14 @@ class AuthCredentials:
         if self.last_refresh is None:
             return True
         return datetime.now(timezone.utc) - self.last_refresh > timedelta(days=8)
+
+
+@dataclass(slots=True)
+class CredentialRecoveryCandidate:
+    home_path: str
+    credentials: AuthCredentials
+    identity: AuthBackedIdentity
+    freshness: datetime
 
 
 def load_identity(codex_home_path: str) -> AuthBackedIdentity:
@@ -85,8 +95,14 @@ def fetch_snapshot(
     credentials = _load_credentials(account.codex_home_path)
 
     if credentials.needs_refresh and credentials.refresh_token:
-        credentials = _refresh(credentials)
-        _save_credentials(credentials, account.codex_home_path)
+        try:
+            credentials = _refresh(credentials)
+            _save_credentials(credentials, account.codex_home_path)
+        except CodexApiError:
+            recovered = _recover_snapshot(account, {credentials.refresh_token}, verify_live_data)
+            if recovered is not None:
+                return recovered
+            raise
 
     try:
         if verify_live_data:
@@ -101,11 +117,17 @@ def fetch_snapshot(
             fallback_email=account.email_hint,
         )
     except CodexApiError as error:
-        if str(error) != "The Codex usage API request returned unauthorized." or not credentials.refresh_token:
+        if str(error) != UNAUTHORIZED_MESSAGE or not credentials.refresh_token:
             raise
 
-    credentials = _refresh(credentials)
-    _save_credentials(credentials, account.codex_home_path)
+    try:
+        credentials = _refresh(credentials)
+        _save_credentials(credentials, account.codex_home_path)
+    except CodexApiError:
+        recovered = _recover_snapshot(account, {credentials.refresh_token}, verify_live_data)
+        if recovered is not None:
+            return recovered
+        raise
     if verify_live_data:
         return _fetch_verified_snapshot(
             codex_home_path=account.codex_home_path,
@@ -193,11 +215,13 @@ def _load_credentials(codex_home_path: str) -> AuthCredentials:
     if not access_token:
         raise CodexApiError("The required token fields are missing from `auth.json`.")
 
+    id_token = _string_value(tokens, "id_token")
+
     return AuthCredentials(
         access_token=access_token,
         refresh_token=_string_value(tokens, "refresh_token") or "",
-        id_token=_string_value(tokens, "id_token"),
-        account_id=_string_value(tokens, "account_id"),
+        id_token=id_token,
+        account_id=_string_value(tokens, "account_id") or _account_id_from_id_token(id_token),
         last_refresh=parse_datetime(payload.get("last_refresh")),
     )
 
@@ -271,7 +295,7 @@ def _refresh(credentials: AuthCredentials) -> AuthCredentials:
         access_token=str(payload.get("access_token") or credentials.access_token),
         refresh_token=str(payload.get("refresh_token") or credentials.refresh_token),
         id_token=payload.get("id_token") or credentials.id_token,
-        account_id=credentials.account_id,
+        account_id=credentials.account_id or _account_id_from_id_token(payload.get("id_token")),
         last_refresh=datetime.now(timezone.utc),
     )
 
@@ -303,7 +327,7 @@ def _fetch_usage(access_token: str, account_id: str | None, codex_home_path: str
         raise CodexApiError("The Codex API response was not in the expected format.")
 
     if response.status_code in (401, 403):
-        raise CodexApiError("The Codex usage API request returned unauthorized.")
+        raise CodexApiError(UNAUTHORIZED_MESSAGE)
 
     message = response.text.strip()
     if message:
@@ -523,6 +547,154 @@ def _role_for_window(window: UsageWindowSnapshot) -> str:
     if window.limit_window_seconds == 604_800:
         return "weekly"
     return "unknown"
+
+
+def _recover_snapshot(
+    account: StoredAccount,
+    excluded_refresh_tokens: set[str],
+    verify_live_data: bool,
+) -> AccountUsageSnapshot | None:
+    for candidate in _recovery_candidates(account, excluded_refresh_tokens):
+        credentials = candidate.credentials
+
+        try:
+            if credentials.needs_refresh and credentials.refresh_token:
+                credentials = _refresh(credentials)
+                _save_credentials(credentials, candidate.home_path)
+
+            snapshot = _fetch_candidate_snapshot(
+                codex_home_path=candidate.home_path,
+                credentials=credentials,
+                fallback_email=account.email_hint,
+                verify_live_data=verify_live_data,
+            )
+            _save_credentials(credentials, account.codex_home_path)
+            return snapshot
+        except CodexApiError as error:
+            if str(error) != UNAUTHORIZED_MESSAGE or not credentials.refresh_token:
+                continue
+
+        try:
+            credentials = _refresh(credentials)
+            _save_credentials(credentials, candidate.home_path)
+            snapshot = _fetch_candidate_snapshot(
+                codex_home_path=candidate.home_path,
+                credentials=credentials,
+                fallback_email=account.email_hint,
+                verify_live_data=verify_live_data,
+            )
+            _save_credentials(credentials, account.codex_home_path)
+            return snapshot
+        except CodexApiError:
+            continue
+
+    return None
+
+
+def _fetch_candidate_snapshot(
+    codex_home_path: str,
+    credentials: AuthCredentials,
+    fallback_email: str | None,
+    verify_live_data: bool,
+) -> AccountUsageSnapshot:
+    if verify_live_data:
+        return _fetch_verified_snapshot(codex_home_path, credentials, fallback_email)
+    return _fetch_snapshot(codex_home_path, credentials, fallback_email)
+
+
+def _recovery_candidates(
+    account: StoredAccount,
+    excluded_refresh_tokens: set[str],
+) -> list[CredentialRecoveryCandidate]:
+    account_home_path = _standardized_path(Path(account.codex_home_path))
+    candidates: list[CredentialRecoveryCandidate] = []
+
+    for home_path in _recovery_home_paths():
+        standardized_home_path = _standardized_path(home_path)
+        if standardized_home_path == account_home_path:
+            continue
+
+        try:
+            credentials = _load_credentials(str(home_path))
+        except CodexApiError:
+            continue
+
+        if credentials.refresh_token in excluded_refresh_tokens:
+            continue
+
+        identity = _identity_from_credentials(credentials)
+        if not _identity_matches_account(identity, standardized_home_path, account):
+            continue
+
+        candidates.append(
+            CredentialRecoveryCandidate(
+                home_path=str(home_path),
+                credentials=credentials,
+                identity=identity,
+                freshness=_credentials_freshness(credentials, home_path),
+            )
+        )
+
+    return sorted(candidates, key=lambda candidate: candidate.freshness, reverse=True)
+
+
+def _recovery_home_paths() -> list[Path]:
+    homes: list[Path] = []
+    if MANAGED_HOMES_DIRECTORY.exists():
+        homes.extend(path for path in MANAGED_HOMES_DIRECTORY.iterdir() if path.is_dir())
+    homes.append(AMBIENT_CODEX_HOME)
+    return homes
+
+
+def _identity_matches_account(identity: AuthBackedIdentity, home_path: str, account: StoredAccount) -> bool:
+    if home_path == _standardized_path(Path(account.codex_home_path)):
+        return True
+
+    account_provider_id = _normalize_identifier(account.provider_account_id)
+    identity_provider_id = _normalize_identifier(identity.provider_account_id)
+    if account_provider_id and identity_provider_id:
+        return account_provider_id == identity_provider_id
+    if account_provider_id or identity_provider_id:
+        return False
+
+    account_subject = _normalize_identifier(account.auth_subject)
+    identity_subject = _normalize_identifier(identity.auth_subject)
+    if account_subject and identity_subject and account_subject == identity_subject:
+        return True
+
+    account_email = _normalize_identifier(account.email_hint)
+    identity_email = _normalize_identifier(identity.email)
+    return bool(account_email and identity_email and account_email == identity_email)
+
+
+def _credentials_freshness(credentials: AuthCredentials, home_path: Path) -> datetime:
+    if credentials.last_refresh is not None:
+        return credentials.last_refresh
+
+    auth_path = home_path / "auth.json"
+    try:
+        return datetime.fromtimestamp(auth_path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _account_id_from_id_token(id_token: Any) -> str | None:
+    payload = _parse_jwt(id_token) if isinstance(id_token, str) else None
+    if not isinstance(payload, dict):
+        return None
+
+    auth = payload.get("https://api.openai.com/auth")
+    auth = auth if isinstance(auth, dict) else {}
+    return _normalize_string(auth.get("chatgpt_account_id")) or _normalize_string(payload.get("chatgpt_account_id"))
+
+
+def _standardized_path(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False)).casefold()
+
+
+def _normalize_identifier(value: str | None) -> str | None:
+    normalized = _normalize_string(value)
+    return normalized.lower() if normalized else None
 
 
 def _string_value(dictionary: dict[str, Any], key: str) -> str | None:

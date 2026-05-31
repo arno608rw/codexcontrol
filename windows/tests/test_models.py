@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from codexcontrol_windows.models import (
     AccountUsageSnapshot,
+    RemovedAccountIdentity,
     StoredAccount,
     StoredAccountSource,
     UsageWindowSnapshot,
@@ -45,6 +46,63 @@ class StoredAccountTests(unittest.TestCase):
         self.assertEqual(original.auth_subject, "auth0|abc")
         self.assertEqual(original.provider_account_id, "account-1")
         self.assertEqual(original.codex_home_path, "C:/temp/b")
+
+    def test_matches_keeps_different_provider_accounts_separate(self) -> None:
+        created_at = datetime(2026, 4, 18, tzinfo=timezone.utc)
+        first = StoredAccount(
+            id=uuid4(),
+            nickname=None,
+            email_hint="user@example.com",
+            auth_subject="auth0|same-user",
+            provider_account_id="account-1",
+            codex_home_path="C:/temp/a",
+            source=StoredAccountSource.MANAGED_BY_APP,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        second = StoredAccount(
+            id=uuid4(),
+            nickname=None,
+            email_hint="user@example.com",
+            auth_subject="auth0|same-user",
+            provider_account_id="account-2",
+            codex_home_path="C:/temp/b",
+            source=StoredAccountSource.MANAGED_BY_APP,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+
+        self.assertFalse(first.matches(second))
+
+    def test_removed_identity_matches_provider_not_shared_email(self) -> None:
+        created_at = datetime(2026, 4, 18, tzinfo=timezone.utc)
+        removed_account = StoredAccount(
+            id=uuid4(),
+            nickname=None,
+            email_hint="user@example.com",
+            auth_subject="auth0|same-user",
+            provider_account_id="account-1",
+            codex_home_path="C:/temp/a",
+            source=StoredAccountSource.MANAGED_BY_APP,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        other_account = StoredAccount(
+            id=uuid4(),
+            nickname=None,
+            email_hint="user@example.com",
+            auth_subject="auth0|same-user",
+            provider_account_id="account-2",
+            codex_home_path="C:/temp/b",
+            source=StoredAccountSource.MANAGED_BY_APP,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+
+        removed = RemovedAccountIdentity.from_account(removed_account)
+
+        self.assertTrue(removed.matches(removed_account))
+        self.assertFalse(removed.matches(other_account))
 
 
 class SnapshotTests(unittest.TestCase):

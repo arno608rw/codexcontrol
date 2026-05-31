@@ -7,7 +7,7 @@ from typing import Iterable
 from uuid import UUID
 
 from .file_locations import ACCOUNTS_FILE, SNAPSHOTS_FILE, ensure_directories
-from .models import AccountUsageSnapshot, StoredAccount
+from .models import AccountUsageSnapshot, RemovedAccountIdentity, StoredAccount
 
 
 def _fold_text(value: str) -> str:
@@ -16,21 +16,42 @@ def _fold_text(value: str) -> str:
 
 
 class AccountStore:
-    current_version = 1
+    current_version = 2
 
     def load_accounts(self) -> list[StoredAccount]:
+        accounts, _ = self.load_account_list()
+        return accounts
+
+    def load_removed_accounts(self) -> list[RemovedAccountIdentity]:
+        _, removed_accounts = self.load_account_list()
+        return removed_accounts
+
+    def load_account_list(self) -> tuple[list[StoredAccount], list[RemovedAccountIdentity]]:
         if not ACCOUNTS_FILE.exists():
-            return []
+            return [], []
 
         payload = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
         accounts = [StoredAccount.from_dict(item) for item in payload.get("accounts", [])]
-        return self._sorted(accounts)
+        removed_accounts = [
+            RemovedAccountIdentity.from_dict(item)
+            for item in payload.get("removedAccounts", [])
+            if isinstance(item, dict)
+        ]
+        return self._sorted(accounts), removed_accounts
 
-    def save_accounts(self, accounts: Iterable[StoredAccount]) -> None:
+    def save_accounts(
+        self,
+        accounts: Iterable[StoredAccount],
+        removed_accounts: Iterable[RemovedAccountIdentity] | None = None,
+    ) -> None:
         ensure_directories()
+        if removed_accounts is None:
+            removed_accounts = self.load_removed_accounts() if ACCOUNTS_FILE.exists() else []
+
         payload = {
             "version": self.current_version,
             "accounts": [account.to_dict() for account in self._sorted(list(accounts))],
+            "removedAccounts": [removed.to_dict() for removed in removed_accounts],
         }
         ACCOUNTS_FILE.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 

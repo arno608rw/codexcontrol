@@ -6,6 +6,13 @@ The format is based on Keep a Changelog and this project uses Semantic Versionin
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent removed accounts from reappearing after managed-home discovery on macOS and Windows
+- Recover stale managed account credentials from newer matching auth homes before surfacing refresh-token errors
+- Decode Plus account credit balances when the Codex usage API returns `credits.balance` as a string
+- Keep distinct provider account IDs separate even when accounts share the same email or auth subject
+
 ## [1.1.3] - 2026-04-23
 
 ### Added

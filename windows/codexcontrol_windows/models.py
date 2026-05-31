@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 
 LEGACY_IMPORTED_VALUE = "".join(["imported", "Codex", "Bar"])
@@ -101,6 +101,10 @@ class StoredAccount:
         return normalize_identifier(self.auth_subject)
 
     @property
+    def normalized_provider_account_id(self) -> str | None:
+        return normalize_identifier(self.provider_account_id)
+
+    @property
     def standardized_home_path(self) -> str:
         return os.path.normcase(os.path.abspath(os.path.normpath(self.codex_home_path)))
 
@@ -115,9 +119,13 @@ class StoredAccount:
         return self.last_authenticated_at or self.updated_at
 
     def matches(self, other: "StoredAccount") -> bool:
-        if self.normalized_auth_subject and self.normalized_auth_subject == other.normalized_auth_subject:
-            return True
         if self.standardized_home_path == other.standardized_home_path:
+            return True
+        if self.normalized_provider_account_id and self.normalized_provider_account_id == other.normalized_provider_account_id:
+            return True
+        if self.normalized_provider_account_id or other.normalized_provider_account_id:
+            return False
+        if self.normalized_auth_subject and self.normalized_auth_subject == other.normalized_auth_subject:
             return True
         if self.normalized_email_hint and self.normalized_email_hint == other.normalized_email_hint:
             return True
@@ -180,6 +188,81 @@ class StoredAccount:
             created_at=parse_datetime(payload["createdAt"]) or utc_now(),
             updated_at=parse_datetime(payload["updatedAt"]) or utc_now(),
             last_authenticated_at=parse_datetime(payload.get("lastAuthenticatedAt")),
+        )
+
+
+@dataclass(slots=True)
+class RemovedAccountIdentity:
+    id: UUID
+    email_hint: str | None
+    auth_subject: str | None
+    provider_account_id: str | None
+    codex_home_path: str
+    source: StoredAccountSource
+    removed_at: datetime
+
+    @classmethod
+    def from_account(cls, account: StoredAccount) -> "RemovedAccountIdentity":
+        return cls(
+            id=uuid4(),
+            email_hint=account.email_hint,
+            auth_subject=account.auth_subject,
+            provider_account_id=account.provider_account_id,
+            codex_home_path=account.codex_home_path,
+            source=account.source,
+            removed_at=utc_now(),
+        )
+
+    @property
+    def normalized_email_hint(self) -> str | None:
+        return normalize_identifier(self.email_hint)
+
+    @property
+    def normalized_auth_subject(self) -> str | None:
+        return normalize_identifier(self.auth_subject)
+
+    @property
+    def normalized_provider_account_id(self) -> str | None:
+        return normalize_identifier(self.provider_account_id)
+
+    @property
+    def standardized_home_path(self) -> str:
+        return os.path.normcase(os.path.abspath(os.path.normpath(self.codex_home_path)))
+
+    def matches(self, account: StoredAccount) -> bool:
+        if self.standardized_home_path == account.standardized_home_path:
+            return True
+        if self.normalized_provider_account_id and self.normalized_provider_account_id == account.normalized_provider_account_id:
+            return True
+        if self.normalized_provider_account_id or account.normalized_provider_account_id:
+            return False
+        if self.normalized_auth_subject and self.normalized_auth_subject == account.normalized_auth_subject:
+            return True
+        if self.normalized_email_hint and self.normalized_email_hint == account.normalized_email_hint:
+            return True
+        return False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "emailHint": self.email_hint,
+            "authSubject": self.auth_subject,
+            "providerAccountID": self.provider_account_id,
+            "codexHomePath": self.codex_home_path,
+            "source": self.source.value,
+            "removedAt": format_datetime(self.removed_at),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RemovedAccountIdentity":
+        return cls(
+            id=UUID(str(payload.get("id") or uuid4())),
+            email_hint=payload.get("emailHint"),
+            auth_subject=payload.get("authSubject"),
+            provider_account_id=payload.get("providerAccountID"),
+            codex_home_path=str(payload.get("codexHomePath") or ""),
+            source=StoredAccountSource.from_raw(str(payload.get("source") or StoredAccountSource.MANAGED_BY_APP.value)),
+            removed_at=parse_datetime(payload.get("removedAt")) or utc_now(),
         )
 
 

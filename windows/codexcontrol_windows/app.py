@@ -21,7 +21,7 @@ from .brand_icon import build_orbit_dial_icon
 from .codex_api import AuthBackedIdentity
 from .codex_api import fetch_snapshot
 from .codex_desktop import CodexDesktopControlError, restart_codex_desktop
-from .models import AccountRuntimeState, AccountUsageSnapshot, StoredAccount, StoredAccountSource, utc_now
+from .models import AccountRuntimeState, AccountUsageSnapshot, RemovedAccountIdentity, StoredAccount, StoredAccountSource, utc_now
 from .presentation_logic import account_sort_key, is_active_account
 from .stores import AccountStore, SnapshotStore
 
@@ -328,6 +328,7 @@ class CodexControlWindowsApp:
         self.events: queue.Queue[tuple[Any, ...]] = queue.Queue()
 
         self.accounts: list[StoredAccount] = []
+        self.removed_accounts: list[RemovedAccountIdentity] = []
         self.runtime_states: dict[UUID, AccountRuntimeState] = {}
         self.nickname_drafts: dict[UUID, str] = {}
         self.selected_account_id: UUID | None = None
@@ -463,9 +464,16 @@ class CodexControlWindowsApp:
         if not self.accounts or self.is_refreshing_all:
             return
 
+        refreshable_accounts = [
+            account for account in self.accounts
+            if not self._requires_reauthentication(account.id)
+        ]
+        if not refreshable_accounts:
+            return
+
         self.is_refreshing_all = True
-        self._group_refresh_pending = len(self.accounts)
-        for account in self.accounts:
+        self._group_refresh_pending = len(refreshable_accounts)
+        for account in refreshable_accounts:
             state = self.runtime_states.setdefault(account.id, AccountRuntimeState())
             state.is_loading = True
             self.runtime_states[account.id] = state
@@ -547,11 +555,6 @@ class CodexControlWindowsApp:
         self._render()
 
     def remove_account(self, account: StoredAccount) -> None:
-        if not account.source.owns_files:
-            self.status_message = "System accounts are auto-discovered and cannot be removed here."
-            self._render()
-            return
-
         confirmed = messagebox.askyesno(
             "Remove Account",
             f"{account.display_name} will be removed from CodexControl.",
@@ -560,14 +563,22 @@ class CodexControlWindowsApp:
         if not confirmed:
             return
 
-        self.accounts = [candidate for candidate in self.accounts if candidate.id != account.id]
+        removed_identity = RemovedAccountIdentity.from_account(account)
+        self.removed_accounts = [candidate for candidate in self.removed_accounts if not candidate.matches(account)]
+        self.removed_accounts.append(removed_identity)
+
+        self.accounts = [
+            candidate
+            for candidate in self.accounts
+            if candidate.id != account.id and not removed_identity.matches(candidate)
+        ]
         self.runtime_states.pop(account.id, None)
         self.nickname_drafts.pop(account.id, None)
         self._mark_accounts_dirty()
         self._mark_runtime_dirty()
         try:
             self.account_manager.remove_managed_files_if_owned(account)
-            self.account_store.save_accounts(self.accounts)
+            self.account_store.save_accounts(self.accounts, self.removed_accounts)
             self._ensure_selection()
             self.status_message = f"{account.display_name} removed."
         except CodexAccountManagerError as error:
@@ -880,17 +891,19 @@ class CodexControlWindowsApp:
 
     def _load_initial_state(self) -> None:
         try:
-            loaded_accounts = self.account_store.load_accounts()
+            loaded_accounts, self.removed_accounts = self.account_store.load_account_list()
+            loaded_accounts = [account for account in loaded_accounts if not self._is_removed(account)]
             stored_accounts = [account for account in loaded_accounts if account.source is not StoredAccountSource.AMBIENT]
             discovered_accounts = self.account_manager.discover_managed_accounts(loaded_accounts)
             ambient_account = self.account_manager.discover_ambient_account(loaded_accounts)
             incoming_accounts = list(discovered_accounts)
             if ambient_account is not None:
                 incoming_accounts.insert(0, ambient_account)
+            incoming_accounts = [account for account in incoming_accounts if not self._is_removed(account)]
 
             self.accounts = self.account_store.merge(stored_accounts, incoming_accounts)
             if self.accounts != loaded_accounts:
-                self.account_store.save_accounts(self.accounts)
+                self.account_store.save_accounts(self.accounts, self.removed_accounts)
         except Exception as error:
             self.status_message = str(error)
             self.accounts = []
@@ -988,8 +1001,9 @@ class CodexControlWindowsApp:
         self._add_handle = None
 
         if account is not None:
+            self._restore_removed_account(account)
             self.accounts = self.account_store.merge(self.accounts, [account])
-            self.account_store.save_accounts(self.accounts)
+            self.account_store.save_accounts(self.accounts, self.removed_accounts)
             self._mark_accounts_dirty()
             matched = next((candidate for candidate in self.accounts if candidate.matches(account)), account)
             self.selected_account_id = matched.id
@@ -1010,8 +1024,9 @@ class CodexControlWindowsApp:
         self._reauth_handle = None
 
         if account is not None:
+            self._restore_removed_account(account)
             self.accounts = self.account_store.merge(self.accounts, [account])
-            self.account_store.save_accounts(self.accounts)
+            self.account_store.save_accounts(self.accounts, self.removed_accounts)
             self._mark_accounts_dirty()
             self.status_message = f"{account.display_name} reauthenticated."
             refreshed = next((candidate for candidate in self.accounts if candidate.id == original_account_id), None)
@@ -1045,7 +1060,7 @@ class CodexControlWindowsApp:
 
     def _persist_accounts_silently(self) -> None:
         try:
-            self.account_store.save_accounts(self.accounts)
+            self.account_store.save_accounts(self.accounts, self.removed_accounts)
         except Exception as error:
             self.status_message = str(error)
 
@@ -1096,6 +1111,20 @@ class CodexControlWindowsApp:
 
     def _refresh_active_identity(self) -> None:
         self.active_identity = self.account_manager.load_active_identity()
+
+    def _is_removed(self, account: StoredAccount) -> bool:
+        return any(removed.matches(account) for removed in self.removed_accounts)
+
+    def _restore_removed_account(self, account: StoredAccount) -> None:
+        self.removed_accounts = [removed for removed in self.removed_accounts if not removed.matches(account)]
+
+    def _requires_reauthentication(self, account_id: UUID) -> bool:
+        state = self.runtime_states.get(account_id)
+        if state is None or not state.error_message:
+            return False
+
+        message = state.error_message.lower()
+        return "refresh token" in message and "sign in again" in message
 
     def _replace_or_append_account(self, account: StoredAccount) -> None:
         replaced = False
