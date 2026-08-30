@@ -48,6 +48,11 @@ struct RootView: View {
                     action: { Task { await self.model.refreshAll() } })
                     .help("Refresh all accounts")
                     .disabled(self.model.isRefreshingAll)
+
+                HeaderIconButton(
+                    systemName: "power",
+                    action: { NSApplication.shared.terminate(nil) })
+                    .help("Quit CodexControl")
             }
         }
         .padding(.horizontal, 2)
