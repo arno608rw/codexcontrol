@@ -99,8 +99,7 @@ enum CodexLoginRunner {
                 return CodexLoginResult(outcome: .missingBinary, output: "")
             }
 
-            var env = ProcessInfo.processInfo.environment
-            env["CODEX_HOME"] = homePath
+            let env = CodexBinaryLocator.resolvedEnvironment(codexHome: homePath, binaryPath: binary)
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
